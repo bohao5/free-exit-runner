@@ -34,6 +34,10 @@ jobs:
           U="u_$(openssl rand -hex 4)"
           P="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 24)"
 
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
+          sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
+          ip -6 addr 2>/dev/null | head -3 || true
+
           microsocks -i 127.0.0.1 -p 1080 -u "$U" -P "$P" >/tmp/microsocks.log 2>&1 &
           MS_PID=$!
           sleep 1
@@ -69,7 +73,7 @@ jobs:
           DIAG=""
           for t in https://www.google.com/generate_204 https://github.com https://chatgpt.com https://www.microsoft.com https://hub.docker.com; do
             dc=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 -4 "$t" || true)
-            sc=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 -4 --proxy "socks5h://$U:$P@127.0.0.1:1080" "$t" || true)
+            sc=$(curl -s -o /dev/null -w '%{http_code}:%{time_total}' --max-time 12 --proxy "socks5h://$U:$P@127.0.0.1:1080" "$t" || true)
             echo "DIAG $t direct=$dc socks=$sc"
             DIAG="$DIAG|$t:$dc/$sc"
           done
