@@ -15,13 +15,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
-      - name: socks-bore-supervisor
+      - name: socks-multi-bore-supervisor
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
           set -u
 
-          # 1) microsocks：apt 优先，源码编译兜底
           if ! command -v microsocks >/dev/null 2>&1; then
             sudo apt-get update -y || true
             if ! sudo apt-get install -y microsocks; then
@@ -32,7 +31,6 @@ jobs:
             fi
           fi
 
-          # 2) 作业内稳定凭据（只随作业轮换，bore 重连不变）
           U="u_$(openssl rand -hex 4)"
           P="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 24)"
 
@@ -41,7 +39,6 @@ jobs:
           sleep 1
           ss -ltnp | grep 1080 || true
 
-          # 3) bore 客户端
           if ! command -v bore >/dev/null 2>&1; then
             mkdir -p /tmp/bore && cd /tmp/bore
             curl -sSL -o bore.tgz https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
@@ -50,67 +47,67 @@ jobs:
             cd /
           fi
 
-          # 4) 分层诊断：运行器直连 vs 经 microsocks（只打状态码，不打印凭据）
-          for t in https://www.google.com/generate_204 https://github.com https://chatgpt.com https://www.microsoft.com https://hub.docker.com https://www.cloudflare.com/cdn-cgi/trace; do
+          start_bore() {
+            : > "/tmp/bore_$1.log"
+            nohup bore local 1080 --to bore.pub > "/tmp/bore_$1.log" 2>&1 &
+            echo $!
+          }
+          port_of() {
+            grep -E 'listening at' "/tmp/bore_$1.log" 2>/dev/null | head -1 | sed -E 's/.*listening at //' | grep -Eo 'bore\.pub:[0-9]+' | head -1
+          }
+
+          declare -A BPID BEP
+          for i in 1 2 3; do
+            BPID[$i]=$(start_bore $i)
+            for k in $(seq 1 12); do sleep 3; [ -n "$(port_of $i)" ] && break; done
+            BEP[$i]=$(port_of $i)
+            echo "SLOT $i pid=${BPID[$i]} ep=${BEP[$i]:-none}"
+            cat "/tmp/bore_$i.log" || true
+          done
+
+          # 运行器侧分层诊断（直连 vs 经 microsocks），结果同时推 ntfy
+          DIAG=""
+          for t in https://www.google.com/generate_204 https://github.com https://chatgpt.com https://www.microsoft.com https://hub.docker.com; do
             dc=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 -4 "$t" || true)
             sc=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 -4 --proxy "socks5h://$U:$P@127.0.0.1:1080" "$t" || true)
             echo "DIAG $t direct=$dc socks=$sc"
+            DIAG="$DIAG|$t:$dc/$sc"
           done
-          echo "--- microsocks log tail ---"
-          tail -n 20 /tmp/microsocks.log || true
-          echo "--- resolver ---"
-          cat /etc/resolv.conf | head -5
-          getent ahostsv4 www.google.com | head -3 || true
-          getent ahostsv6 www.google.com | head -3 || true
 
-          # 5) 监督循环：bore 存活即复用；死亡则换端口重发
+          TRACE=$(curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace || true)
+          IPINFO=$(curl -s --max-time 15 https://ipinfo.io/json || true)
+          RUNNER_IP=$(echo "$TRACE" | sed -n 's/^ip=//p')
+          ASN=$(echo "$IPINFO" | sed -n 's/.*"org": *"\([^"]*\)".*/\1/p')
+
+          publish() {
+            EPS=""
+            for i in 1 2 3; do [ -n "${BEP[$i]:-}" ] && EPS="$EPS ${BEP[$i]}"; done
+            if [ -n "${NTFY_TOPIC:-}" ]; then
+              curl -sS --max-time 15 -d "eps=$EPS user=$U pass=$P runner_ip=$RUNNER_IP asn=$ASN ts=$(date +%s) job=${GITHUB_RUN_ID} diag=$DIAG" "https://ntfy.sh/$NTFY_TOPIC" || true
+            fi
+            echo "::notice::EXIT_EPS=$EPS"
+          }
+          publish
+
           DEADLINE=$(( $(date +%s) + 19200 ))
-          CYCLE=0
+          C=0
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-            CYCLE=$((CYCLE+1))
-            : > /tmp/tunnel_bore.log
-            nohup bore local 1080 --to bore.pub > /tmp/tunnel_bore.log 2>&1 &
-            BPID=$!
-            EP=""
-            for i in $(seq 1 12); do
-              sleep 3
-              grep -Eq 'listening at' /tmp/tunnel_bore.log && break
-            done
-            echo "----- cycle $CYCLE bore raw -----"
-            cat /tmp/tunnel_bore.log
-            line=$(grep -E 'listening at' /tmp/tunnel_bore.log | head -1)
-            if [ -n "$line" ]; then
-              ep=$(echo "$line" | sed -E 's/.*listening at //' | grep -Eo 'bore\.pub:[0-9]+' | head -1)
-              h=${ep%%:*}
-              case "$h" in localhost|127.*|0.0.0.0|::1|"") ep="" ;; esac
-              [ -n "$ep" ] && EP="$ep"
-            fi
-
-            TRACE=$(curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace || true)
-            IPINFO=$(curl -s --max-time 15 https://ipinfo.io/json || true)
-            RUNNER_IP=$(echo "$TRACE" | sed -n 's/^ip=//p')
-            ASN=$(echo "$IPINFO" | sed -n 's/.*"org": *"\([^"]*\)".*/\1/p')
-
-            if [ -n "$EP" ] && [ -n "${NTFY_TOPIC:-}" ]; then
-              MSG="ep=$EP user=$U pass=$P runner_ip=$RUNNER_IP asn=$ASN ts=$(date +%s) job=${GITHUB_RUN_ID} cycle=$CYCLE trace=$(echo "$TRACE" | tr '\n' ';')"
-              curl -sS --max-time 15 -d "$MSG" "https://ntfy.sh/$NTFY_TOPIC" || true
-              echo "::notice::EXIT_EP=$EP cycle=$CYCLE"
-            else
-              echo "::warning::BORE_FAILED cycle=$CYCLE"
-            fi
-
-            # 存活监视：每 30s 探一次 bore 进程；每 10 分钟发心跳
-            N=0
-            while kill -0 "$BPID" 2>/dev/null && [ "$(date +%s)" -lt "$DEADLINE" ]; do
-              sleep 30
-              N=$((N+1))
-              if [ $((N % 20)) -eq 0 ] && [ -n "${EP:-}" ] && [ -n "${NTFY_TOPIC:-}" ]; then
-                curl -sS --max-time 10 -d "hb=1 ep=$EP ts=$(date +%s) job=${GITHUB_RUN_ID}" "https://ntfy.sh/$NTFY_TOPIC" || true
+            sleep 20
+            C=$((C+1))
+            CHANGED=0
+            for i in 1 2 3; do
+              if ! kill -0 "${BPID[$i]}" 2>/dev/null; then
+                echo "SLOT $i dead, restart"
+                BPID[$i]=$(start_bore $i)
+                for k in $(seq 1 12); do sleep 3; [ -n "$(port_of $i)" ] && break; done
+                NEWEP=$(port_of $i)
+                if [ -n "$NEWEP" ]; then BEP[$i]=$NEWEP; CHANGED=1; fi
               fi
             done
-            echo "BORE_DOWN cycle=$CYCLE ep=${EP:-none}"
-            kill "$BPID" 2>/dev/null || true
-            sleep 5
+            if [ "$CHANGED" = "1" ] || [ $((C % 30)) -eq 0 ]; then
+              publish
+            fi
           done
-          echo "SUPERVISOR_DONE cycles=$CYCLE"
+          echo "SUPERVISOR_DONE"
+          for i in 1 2 3; do kill "${BPID[$i]}" 2>/dev/null || true; done
           kill "$MS_PID" 2>/dev/null || true
