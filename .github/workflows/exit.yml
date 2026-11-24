@@ -47,7 +47,7 @@ jobs:
             cd /
           fi
 
-          # 5) bore 隧道，最多 3 次；门控排除 localhost/127.0.0.1/0.0.0.0/::1
+          # 5) bore 隧道，最多 3 次；只认 listening at 之后的 bore.pub:port
           EP=""; BHOST=""; BPORT=""
           for attempt in 1 2 3; do
             : > /tmp/tunnel_bore.log
@@ -57,15 +57,15 @@ jobs:
               sleep 3
               grep -Eq 'listening at' /tmp/tunnel_bore.log && break
             done
+            echo "----- bore attempt $attempt raw output -----"
+            cat /tmp/tunnel_bore.log
             line=$(grep -E 'listening at' /tmp/tunnel_bore.log | head -1)
             if [ -n "$line" ]; then
-              ep=$(echo "$line" | grep -Eo '[0-9a-zA-Z.-]+:[0-9]{2,5}' | head -1)
+              ep=$(echo "$line" | sed -E 's/.*listening at //' | grep -Eo 'bore\.pub:[0-9]+' | head -1)
               h=${ep%%:*}; p=${ep##*:}
               case "$h" in localhost|127.*|0.0.0.0|::1|"") ep="" ;; esac
               if [ -n "$ep" ]; then EP="$ep"; BHOST="$h"; BPORT="$p"; break; fi
             fi
-            echo "bore attempt $attempt failed; raw output:"
-            cat /tmp/tunnel_bore.log
             kill $BPID 2>/dev/null || true
             sleep 2
           done
