@@ -1,0 +1,96 @@
+name: free-exit-runner
+run-name: free-exit-runner-${{ github.run_number }}
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'
+permissions:
+  contents: read
+jobs:
+  exit:
+    name: exit-socks
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: socks-bore-publish
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          set -u
+
+          # 1) 安装 microsocks：apt 优先，源码编译兜底
+          if ! command -v microsocks >/dev/null 2>&1; then
+            sudo apt-get update -y || true
+            if ! sudo apt-get install -y microsocks; then
+              sudo apt-get install -y build-essential git
+              git clone --depth=1 https://github.com/rofl0r/microsocks /tmp/microsocks
+              make -C /tmp/microsocks
+              sudo install -m 755 /tmp/microsocks/microsocks /usr/local/bin/
+            fi
+          fi
+
+          # 2) 运行时随机代理凭据（不落 YAML、不入作业日志）
+          U="u_$(openssl rand -hex 4)"
+          P="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 24)"
+
+          # 3) 仅监听回环 socks5（1080）
+          microsocks -i 127.0.0.1 -p 1080 -u "$U" -P "$P" >/tmp/microsocks.log 2>&1 &
+          sleep 1
+          ss -ltnp | grep 1080 || true
+
+          # 4) bore 客户端
+          if ! command -v bore >/dev/null 2>&1; then
+            mkdir -p /tmp/bore && cd /tmp/bore
+            curl -sSL -o bore.tgz https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
+            tar xzf bore.tgz
+            sudo install -m 755 bore /usr/local/bin/ 2>/dev/null || install -m 755 bore /usr/local/bin/
+            cd /
+          fi
+
+          # 5) bore 隧道，最多 3 次；门控排除 localhost/127.0.0.1/0.0.0.0/::1
+          EP=""; BHOST=""; BPORT=""
+          for attempt in 1 2 3; do
+            : > /tmp/tunnel_bore.log
+            nohup bore local 1080 --to bore.pub > /tmp/tunnel_bore.log 2>&1 &
+            BPID=$!
+            for i in $(seq 1 10); do
+              sleep 3
+              grep -Eq 'listening at' /tmp/tunnel_bore.log && break
+            done
+            line=$(grep -E 'listening at' /tmp/tunnel_bore.log | head -1)
+            if [ -n "$line" ]; then
+              ep=$(echo "$line" | grep -Eo '[0-9a-zA-Z.-]+:[0-9]{2,5}' | head -1)
+              h=${ep%%:*}; p=${ep##*:}
+              case "$h" in localhost|127.*|0.0.0.0|::1|"") ep="" ;; esac
+              if [ -n "$ep" ]; then EP="$ep"; BHOST="$h"; BPORT="$p"; break; fi
+            fi
+            echo "bore attempt $attempt failed; raw output:"
+            cat /tmp/tunnel_bore.log
+            kill $BPID 2>/dev/null || true
+            sleep 2
+          done
+
+          # 6) 运行器直连出口证据
+          TRACE=$(curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace || true)
+          IPINFO=$(curl -s --max-time 15 https://ipinfo.io/json || true)
+          RUNNER_IP=$(echo "$TRACE" | sed -n 's/^ip=//p')
+          [ -z "$RUNNER_IP" ] && RUNNER_IP=$(echo "$IPINFO" | sed -n 's/.*"ip": *"\([^"]*\)".*/\1/p')
+          ASN=$(echo "$IPINFO" | sed -n 's/.*"org": *"\([^"]*\)".*/\1/p')
+
+          echo "EXIT_EP=$EP"
+          echo "RUNNER_IP=$RUNNER_IP"
+          echo "===TRACE==="; echo "$TRACE"
+          echo "===IPINFO==="; echo "$IPINFO"
+
+          # 7) 端点发布到 ntfy（topic 取自 Secret；代理凭据仅出现在此消息内）
+          if [ -n "$EP" ] && [ -n "${NTFY_TOPIC:-}" ]; then
+            TRACE_SAFE=$(echo "$TRACE" | tr '\n' ';')
+            MSG="ep=$EP user=$U pass=$P runner_ip=$RUNNER_IP asn=$ASN trace=$TRACE_SAFE"
+            curl -sS --max-time 15 -d "$MSG" "https://ntfy.sh/$NTFY_TOPIC" || true
+            echo "::notice::EXIT_EP=$EP"
+          else
+            echo "::warning::BORE_OR_NTFY_FAILED"
+          fi
+
+          # 8) 保持隧道至超时
+          sleep 20000
