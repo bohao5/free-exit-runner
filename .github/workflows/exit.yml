@@ -4,6 +4,9 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '0 */5 * * *'
+concurrency:
+  group: free-exit
+  cancel-in-progress: false
 permissions:
   contents: read
 jobs:
@@ -12,13 +15,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
-      - name: socks-bore-publish
+      - name: socks-bore-supervisor
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
           set -u
 
-          # 1) 安装 microsocks：apt 优先，源码编译兜底
+          # 1) microsocks：apt 优先，源码编译兜底
           if ! command -v microsocks >/dev/null 2>&1; then
             sudo apt-get update -y || true
             if ! sudo apt-get install -y microsocks; then
@@ -29,16 +32,16 @@ jobs:
             fi
           fi
 
-          # 2) 运行时随机代理凭据（不落 YAML、不入作业日志）
+          # 2) 作业内稳定凭据（只随作业轮换，bore 重连不变）
           U="u_$(openssl rand -hex 4)"
           P="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 24)"
 
-          # 3) 仅监听回环 socks5（1080）
           microsocks -i 127.0.0.1 -p 1080 -u "$U" -P "$P" >/tmp/microsocks.log 2>&1 &
+          MS_PID=$!
           sleep 1
           ss -ltnp | grep 1080 || true
 
-          # 4) bore 客户端
+          # 3) bore 客户端
           if ! command -v bore >/dev/null 2>&1; then
             mkdir -p /tmp/bore && cd /tmp/bore
             curl -sSL -o bore.tgz https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
@@ -47,50 +50,67 @@ jobs:
             cd /
           fi
 
-          # 5) bore 隧道，最多 3 次；只认 listening at 之后的 bore.pub:port
-          EP=""; BHOST=""; BPORT=""
-          for attempt in 1 2 3; do
+          # 4) 分层诊断：运行器直连 vs 经 microsocks（只打状态码，不打印凭据）
+          for t in https://www.google.com/generate_204 https://github.com https://chatgpt.com https://www.microsoft.com https://hub.docker.com https://www.cloudflare.com/cdn-cgi/trace; do
+            dc=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 -4 "$t" || true)
+            sc=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 -4 --proxy "socks5h://$U:$P@127.0.0.1:1080" "$t" || true)
+            echo "DIAG $t direct=$dc socks=$sc"
+          done
+          echo "--- microsocks log tail ---"
+          tail -n 20 /tmp/microsocks.log || true
+          echo "--- resolver ---"
+          cat /etc/resolv.conf | head -5
+          getent ahostsv4 www.google.com | head -3 || true
+          getent ahostsv6 www.google.com | head -3 || true
+
+          # 5) 监督循环：bore 存活即复用；死亡则换端口重发
+          DEADLINE=$(( $(date +%s) + 19200 ))
+          CYCLE=0
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            CYCLE=$((CYCLE+1))
             : > /tmp/tunnel_bore.log
             nohup bore local 1080 --to bore.pub > /tmp/tunnel_bore.log 2>&1 &
             BPID=$!
-            for i in $(seq 1 10); do
+            EP=""
+            for i in $(seq 1 12); do
               sleep 3
               grep -Eq 'listening at' /tmp/tunnel_bore.log && break
             done
-            echo "----- bore attempt $attempt raw output -----"
+            echo "----- cycle $CYCLE bore raw -----"
             cat /tmp/tunnel_bore.log
             line=$(grep -E 'listening at' /tmp/tunnel_bore.log | head -1)
             if [ -n "$line" ]; then
               ep=$(echo "$line" | sed -E 's/.*listening at //' | grep -Eo 'bore\.pub:[0-9]+' | head -1)
-              h=${ep%%:*}; p=${ep##*:}
+              h=${ep%%:*}
               case "$h" in localhost|127.*|0.0.0.0|::1|"") ep="" ;; esac
-              if [ -n "$ep" ]; then EP="$ep"; BHOST="$h"; BPORT="$p"; break; fi
+              [ -n "$ep" ] && EP="$ep"
             fi
-            kill $BPID 2>/dev/null || true
-            sleep 2
+
+            TRACE=$(curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace || true)
+            IPINFO=$(curl -s --max-time 15 https://ipinfo.io/json || true)
+            RUNNER_IP=$(echo "$TRACE" | sed -n 's/^ip=//p')
+            ASN=$(echo "$IPINFO" | sed -n 's/.*"org": *"\([^"]*\)".*/\1/p')
+
+            if [ -n "$EP" ] && [ -n "${NTFY_TOPIC:-}" ]; then
+              MSG="ep=$EP user=$U pass=$P runner_ip=$RUNNER_IP asn=$ASN ts=$(date +%s) job=${GITHUB_RUN_ID} cycle=$CYCLE trace=$(echo "$TRACE" | tr '\n' ';')"
+              curl -sS --max-time 15 -d "$MSG" "https://ntfy.sh/$NTFY_TOPIC" || true
+              echo "::notice::EXIT_EP=$EP cycle=$CYCLE"
+            else
+              echo "::warning::BORE_FAILED cycle=$CYCLE"
+            fi
+
+            # 存活监视：每 30s 探一次 bore 进程；每 10 分钟发心跳
+            N=0
+            while kill -0 "$BPID" 2>/dev/null && [ "$(date +%s)" -lt "$DEADLINE" ]; do
+              sleep 30
+              N=$((N+1))
+              if [ $((N % 20)) -eq 0 ] && [ -n "${EP:-}" ] && [ -n "${NTFY_TOPIC:-}" ]; then
+                curl -sS --max-time 10 -d "hb=1 ep=$EP ts=$(date +%s) job=${GITHUB_RUN_ID}" "https://ntfy.sh/$NTFY_TOPIC" || true
+              fi
+            done
+            echo "BORE_DOWN cycle=$CYCLE ep=${EP:-none}"
+            kill "$BPID" 2>/dev/null || true
+            sleep 5
           done
-
-          # 6) 运行器直连出口证据
-          TRACE=$(curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace || true)
-          IPINFO=$(curl -s --max-time 15 https://ipinfo.io/json || true)
-          RUNNER_IP=$(echo "$TRACE" | sed -n 's/^ip=//p')
-          [ -z "$RUNNER_IP" ] && RUNNER_IP=$(echo "$IPINFO" | sed -n 's/.*"ip": *"\([^"]*\)".*/\1/p')
-          ASN=$(echo "$IPINFO" | sed -n 's/.*"org": *"\([^"]*\)".*/\1/p')
-
-          echo "EXIT_EP=$EP"
-          echo "RUNNER_IP=$RUNNER_IP"
-          echo "===TRACE==="; echo "$TRACE"
-          echo "===IPINFO==="; echo "$IPINFO"
-
-          # 7) 端点发布到 ntfy（topic 取自 Secret；代理凭据仅出现在此消息内）
-          if [ -n "$EP" ] && [ -n "${NTFY_TOPIC:-}" ]; then
-            TRACE_SAFE=$(echo "$TRACE" | tr '\n' ';')
-            MSG="ep=$EP user=$U pass=$P runner_ip=$RUNNER_IP asn=$ASN trace=$TRACE_SAFE"
-            curl -sS --max-time 15 -d "$MSG" "https://ntfy.sh/$NTFY_TOPIC" || true
-            echo "::notice::EXIT_EP=$EP"
-          else
-            echo "::warning::BORE_OR_NTFY_FAILED"
-          fi
-
-          # 8) 保持隧道至超时
-          sleep 20000
+          echo "SUPERVISOR_DONE cycles=$CYCLE"
+          kill "$MS_PID" 2>/dev/null || true
